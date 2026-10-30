@@ -126,7 +126,15 @@ columns = ['image_id','path','location','datetime','blur_score','status','md_con
 master[columns].to_csv(OUT/'master.csv', index=False)
 
 # Synthetic dashboard starter data; values are fake and are tagged in README.
-fake = master.head(50)[columns].copy().astype(object)
+# Select a dashboard-friendly mix rather than taking the first 50 subset rows,
+# which may all belong to the empty-image portion of the selection.
+fake_empty = master[master["gt_species"].eq("empty")].sample(n=12, random_state=SEED)
+animal_pool = master[~master["gt_species"].eq("empty")]
+one_per_species = animal_pool.groupby("gt_species", group_keys=False).sample(n=1, random_state=SEED)
+remaining_animals = animal_pool.drop(index=one_per_species.index).sample(
+    n=38 - len(one_per_species), random_state=SEED
+)
+fake = pd.concat([fake_empty, one_per_species, remaining_animals], ignore_index=True)[columns].copy().astype(object)
 rng = random.Random(SEED)
 for i in range(len(fake)):
     label = fake.iloc[i]['gt_species']
