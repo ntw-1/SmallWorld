@@ -1,0 +1,4 @@
+eccv_18_all_images_sm.tar.gz
+eccv_18_annotations.tar.gz
+__pycache__/
+*.py[cod]
