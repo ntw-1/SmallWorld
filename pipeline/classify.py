@@ -4,6 +4,7 @@ The SpeciesNet ensemble already rolls low-confidence predictions up the taxonomy
 (species -> genus -> family -> order -> class); we record the level reached and
 flag anything below CONF_MIN, or not resolved to species, for human review.
 """
+import os
 import sqlite3
 from pathlib import Path
 from config import DB_PATH
@@ -11,6 +12,16 @@ from config import DB_PATH
 CONF_MIN = 0.5
 BATCH = 32
 LEVELS = ["class", "order", "family", "genus", "species"]   # label parts 1..5
+
+
+def _norm(p) -> str:
+    """Normalise a path for matching: resolves '..'/'.' segments and
+    case-folds on Windows (where paths are case-insensitive), without
+    touching the filesystem. Path.resolve() is avoided here because it
+    can mint a different string for the same file (e.g. an extended-length
+    \\\\?\\ prefix, or a differently-cased drive letter) than what
+    SpeciesNet echoes back, which silently drops every match."""
+    return os.path.normcase(os.path.normpath(str(p)))
 
 
 def parse_label(label: str):
@@ -44,13 +55,17 @@ def run():
     print("Loading SpeciesNet (first run downloads model weights) ...")
     model = SpeciesNet(DEFAULT_MODEL, geofence=False)
 
+    total_skipped = 0
     for start in range(0, len(rows), BATCH):
         chunk = rows[start:start + BATCH]
         out = model.predict(filepaths=[p for _, p in chunk], run_mode="single_thread", progress_bars=False)
-        by_path = {Path(p["filepath"]).resolve(): p for p in out.get("predictions", [])}
+        preds = out.get("predictions", [])
+        by_path = {_norm(p["filepath"]): p for p in preds if "filepath" in p}
+        chunk_skipped = 0
         for det_id, crop in chunk:
-            pr = by_path.get(Path(crop).resolve())
+            pr = by_path.get(_norm(crop))
             if not pr or "prediction" not in pr:
+                chunk_skipped += 1
                 continue
             common, sci, family, level = parse_label(pr["prediction"])
             conf1 = float(pr.get("prediction_score") or 0.0)
@@ -67,8 +82,16 @@ def run():
             if review:
                 conn.execute("UPDATE detections SET needs_review=1 WHERE id=?", (det_id,))
         conn.commit()
-        print(f"  {min(start + BATCH, len(rows))}/{len(rows)}")
+        total_skipped += chunk_skipped
+        status = f"  {min(start + BATCH, len(rows))}/{len(rows)}"
+        if chunk_skipped:
+            status += f"  ({chunk_skipped} unmatched - got {len(preds)} predictions back for {len(chunk)} crops)"
+        print(status)
     conn.close()
+    if total_skipped:
+        print(f"WARNING: {total_skipped}/{len(rows)} crops had no matching SpeciesNet prediction and were "
+              f"not written to the database. This usually means the path SpeciesNet echoed back doesn't "
+              f"match the crop_path stored in the database - check that filepaths above look identical.")
     print("Classification complete.")
 
 
