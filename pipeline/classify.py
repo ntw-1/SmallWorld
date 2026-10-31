@@ -64,12 +64,23 @@ def run():
         chunk_skipped = 0
         for det_id, crop in chunk:
             pr = by_path.get(_norm(crop))
-            if not pr or "prediction" not in pr:
+            if not pr:
                 chunk_skipped += 1
                 continue
-            common, sci, family, level = parse_label(pr["prediction"])
-            conf1 = float(pr.get("prediction_score") or 0.0)
-            scores = (pr.get("classifications") or {}).get("scores", [])
+            # SpeciesNet >= 4.0 nests the classification under
+            # predictions[i]["detections"][j]["processed_classification"]
+            # rather than the old flat "prediction"/"prediction_score"/
+            # "classifications" keys. Pick the highest-confidence detection
+            # (crops are already localised, so there's normally just one).
+            dets = pr.get("detections") or []
+            d0 = max(dets, key=lambda d: d.get("conf", 0)) if dets else None
+            pc = (d0 or {}).get("processed_classification")
+            if not pc or "class" not in pc:
+                chunk_skipped += 1
+                continue
+            common, sci, family, level = parse_label(pc["class"])
+            conf1 = float(pc.get("score") or 0.0)
+            scores = (d0.get("raw_classifications") or {}).get("scores", [])
             c2 = float(scores[1]) if len(scores) > 1 else None
             c3 = float(scores[2]) if len(scores) > 2 else None
             review = conf1 < CONF_MIN or level != "species"
@@ -85,13 +96,13 @@ def run():
         total_skipped += chunk_skipped
         status = f"  {min(start + BATCH, len(rows))}/{len(rows)}"
         if chunk_skipped:
-            status += f"  ({chunk_skipped} unmatched - got {len(preds)} predictions back for {len(chunk)} crops)"
+            status += f"  ({chunk_skipped} skipped - no detections/classification for that crop)"
         print(status)
     conn.close()
     if total_skipped:
-        print(f"WARNING: {total_skipped}/{len(rows)} crops had no matching SpeciesNet prediction and were "
-              f"not written to the database. This usually means the path SpeciesNet echoed back doesn't "
-              f"match the crop_path stored in the database - check that filepaths above look identical.")
+        print(f"NOTE: {total_skipped}/{len(rows)} crops had no SpeciesNet detection/classification result "
+              f"(e.g. the crop was too ambiguous for SpeciesNet's own internal detector) and were left "
+              f"unclassified. They'll be retried on the next classify run.")
     print("Classification complete.")
 
 
