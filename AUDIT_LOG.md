@@ -1,6 +1,6 @@
 # SmallWorld: project audit and team handoff
 
-Last updated: 2026-10-31
+Last updated: 2026-10-31 (pipeline + dashboard track added. See section 12)
 
 This document explains the hackathon project, the files in this repository,
 what has been completed, and the next steps for every role.
@@ -36,14 +36,26 @@ The dashboard is a hackathon demo, not a validated ecological study.
 - Local checks passed: 2,500 CSV rows loaded, 2,500 image paths existed, all
   datetimes parsed, analytics ran, and the summary text generated.
 
+### Completed on the pipeline + dashboard track (Nikita, 2026-10-31)
+
+Full details are in section 12.
+
+- Blur scoring (`pipeline/quality.py`, Laplacian variance, threshold 100).
+- MegaDetector v5 detection with animal/person/vehicle confidences, bounding boxes and
+  saved crops (`pipeline/detect.py`). It was run on a 100-image sample.
+- SpeciesNet classification code with taxonomic roll-up (`pipeline/classify.py`). Written but
+  **not yet run** on the sample.
+- 30-minute encounter grouping in R with a Python fallback (`pipeline/encounter.py`), plus a
+  live pandas version inside the dashboard.
+- Featherless LLM field-report summariser (`llm/summariser.py`).
+- A five-page Streamlit dashboard in the SmallWorld design (`dashboard/`).
+
 ### Not completed yet
 
-- Blur scoring.
-- MegaDetector or another animal detector.
-- Animal/person/vehicle detection confidence and bounding boxes.
-- Species classification.
-- Real pipeline values written into `data/master.csv`.
-- Streamlit dashboard (`app.py`).
+- SpeciesNet run on the sample (`python run_pipeline.py --step classify`).
+- Pipeline run beyond the first 100 images.
+- Writing pipeline results back into the shared `data/master.csv` (the two tracks use
+  different storage; see section 12.5).
 - Final dashboard review and demo preparation.
 
 ## 3. Dataset facts and limits
@@ -99,6 +111,12 @@ SmallWorld/
 ├── data_utils.py                # load_master() and get_image_path()
 ├── analytics.py                 # tables and encounter grouping
 ├── summary.py                   # plain-English Insights summary
+├── config.py / run_pipeline.py / requirements.txt   # pipeline + dashboard (section 12)
+├── pipeline/                    # ingest, extract, quality, detect, classify, encounter
+├── llm/                         # Featherless summariser
+├── r_scripts/                   # R encounter counting
+├── dashboard/                   # Streamlit app, components, pages, assets
+├── .streamlit/                  # dashboard theme config
 └── data/
     ├── README.md                # data-specific documentation and stats
     ├── master.csv               # real metadata; model columns are blank
@@ -183,6 +201,8 @@ the fact that the results come from a limited subset.
 | `8e2def6` | Merged the pre-existing repository `main` history. |
 | `0946270` | Added `analytics.py` and fixed the fake dashboard data mix. |
 | `300e588` | Added `summary.py`. |
+| `acd29e5` | Added this audit and team handoff. |
+| _next_ | Added the pipeline + SmallWorld dashboard track, README and section 12 of this log. |
 
 The current shared branch is `main`. Before starting work, run:
 
@@ -321,3 +341,94 @@ Expected output is `2500 True`.
 | Dashboard + demo | `app.py`, dashboard behavior, slides, presentation. |
 
 Keep changes small, commit often, and pull before each work session.
+
+## 12. Pipeline + dashboard track (Nikita): change log and audit
+
+This track is a separate, end-to-end implementation. It stores results in SQLite
+(`data/db/wildlife.db`, created locally and not committed) and serves them through a
+Streamlit dashboard. It does not modify `data/master.csv` or any of the files in sections 4–10.
+
+### 12.1 Database schema (`pipeline/ingest.py`)
+
+| Table | Key columns |
+| --- | --- |
+| `media` | `image_id`, `file_path`, `location_id`, `datetime`, `sequence_id`, `blur_score`, `status`, `gt_label` |
+| `detections` | `id`, `image_id`, `category`, `confidence`, `bbox_x/y/w/h` (normalised), `crop_path`, `needs_review`, `reviewed`* |
+| `classifications` | `id`, `detection_id`, `species_common`, `species_sci`, `family`, `conf_top1..3`, `rolled_up_to`, `human_label`, `status` |
+| `encounters` | `location_id`, `species_common`, `event_start`, `event_end`, `image_count`, `trap_nights` |
+
+\* `detections.reviewed` is added automatically (idempotent `ALTER TABLE`) the first time a
+decision is saved in the Review Queue.
+
+`media.status` moves through `pending` → `sharp` / `blurry` / `missing` → `animal_detected` /
+`needs_review` / `empty`. `classifications.status` is `auto`, `needs_review`, `human_verified`
+or `rejected`.
+
+### 12.2 Change log
+
+| # | Change | Why / outcome |
+| --- | --- | --- |
+| 1 | Built `pipeline/` (ingest, extract, quality, detect, classify, encounter), `run_pipeline.py`, `config.py`, `llm/summariser.py`, `r_scripts/encounter_count.R` and a basic 7-page dashboard. | First end-to-end version. |
+| 2 | Ingest handles the CCT annotation file being a **tar of 5 JSONs** (as well as gzip or plain JSON). | The downloaded `caltech_coco.json` turned out to be a tar. |
+| 3 | Rewrote `classify.py` against the real SpeciesNet API (`SpeciesNet(DEFAULT_MODEL).predict(filepaths=…)`) and its label format `uuid;class;order;family;genus;species;common`. | The first version guessed the API. |
+| 4 | `detect.py` uses the `megadetector` package (`load_detector`, auto-download of MDV5A). | Fixed `No module named utils` from the old YOLOv5 path. |
+| 5 | Ran ingest → quality → detect on a 100-image sample. | Produced the verified numbers in 12.3. |
+| 6 | **Redesign v1 (SmallWorld design system)** shipped a single-page `app.py`. It crashed with `sqlite3.OperationalError: no such column: m.seq_id`. | Root cause: the queries were written against an assumed schema, not the real one (the column is `sequence_id`). The rewrite also hid the other pages. |
+| 7 | Rewrote `dashboard/components/data_queries.py` against the real schema with column checks (`PRAGMA table_info`), a cache keyed on the database's modified time, and a species-label priority of human, then SpeciesNet, then ground truth. | Fixes the crash and keeps the dashboard useful before SpeciesNet has been run. |
+| 8 | Encounters are recomputed live in pandas with the same 30-minute rule, so they respond to the confidence gate. Trap-nights are distinct camera-days with a capture. | Matches `pipeline/encounter.py` and the rule in section 7. |
+| 9 | Benchmarks computed against CCT ground truth: MegaDetector image-level precision, recall, F1 and confusion counts; SpeciesNet top-1 accuracy and roll-up rate (excluding human labels); blur and empty-frame rates. | Replaces placeholder metrics with real ones. |
+| 10 | Multipage dashboard using `st.navigation`, inline SVG charts, and amber bounding-box overlays on the images. | Implements the SmallWorld design. |
+| 11 | Review Queue writes decisions back. Accept, relabel or reject a prediction; or confirm a box and its label (inserts a `human_verified` classification) or mark a false trigger (`category='false_positive'`, image set to `empty` if no animal boxes are left). | Scientist-in-the-loop verification. |
+| 12 | Removed the **Bio-Analytics** and **Fauna Classifiers** pages. Renamed Grid Viewport to **Sightings**, AI Synthesis to **AI Summary** and Station Network to **Site Activity**. Activity Timeline is now the home page. | Requested scope change. |
+| 13 | Replaced the top nav bar with a **☰ sidebar drawer** to the left of the SmallWorld logo; the button and logo stay in the same place whether the drawer is open or closed. | Requested navigation change. |
+
+### 12.3 Verified results (local 100-image sample, 2026-10-31)
+
+Checked by running the dashboard against a copy of the real database:
+
+- 100 images, 20 locations, dated 2010-07-30 to 2014-10-12. All 100 passed the blur gate (mean
+  Laplacian variance 779).
+- MegaDetector: 95 boxes (86 animal, 5 person, 4 vehicle). 80 images `animal_detected`, 20 `empty`.
+- **MegaDetector against ground truth (image level): precision 98.8%, recall 89.8%, F1 0.940**
+  (TP 79, FP 1, FN 9, TN 11).
+- At the 50% confidence gate: 76 animal detections, 72 independent encounters, 11 taxa, 54.2%
+  nocturnal.
+- SpeciesNet: 0 classifications so far. The dashboard shows ground-truth labels marked as such.
+- Tests: all five pages load with no exceptions on the real database copy and on a simulated
+  database containing classifications. Review Queue saves were confirmed in SQLite. Every
+  sidebar link was click-tested.
+
+### 12.4 Known limitations
+
+- Encounter rates per station rest on 2–5 encounters each and are indicative only.
+- These benchmark numbers come from 100 frames drawn across the official splits and must not
+  be quoted as CCT benchmark accuracy (same warning as section 3).
+- `requirements.txt` does not pin versions. The dashboard needs Streamlit 1.46 or newer and was
+  tested on 1.66.1.
+- `dashboard/components/bbox_draw.py` and `confidence_filter.py` are no longer used and can be
+  removed.
+- The dashboard loads fonts from Google Fonts. Without internet access it falls back to
+  system fonts.
+
+### 12.5 Integration items for the team
+
+1. **Two stores.** The analytics track reads `data/master.csv`; this track writes SQLite. Agree
+   on one. The simplest option is an export from SQLite into the `master.csv` columns in section 5
+   (`blur_score`, `status`, `md_conf`, `bbox`, `species`, `species_conf`).
+2. **Threshold mismatch.** Section 6 uses `Identified` at species confidence ≥ 0.60. `classify.py`
+   flags below 0.50. Pick one value.
+3. **Status vocabulary.** `Identified/Uncertain/Needs Review/Empty` (CSV) versus
+   `animal_detected/needs_review/empty/blurry` (SQLite) needs a mapping.
+4. **Day/night definition.** The CSV track uses day = 06:00–17:59. The dashboard uses nocturnal
+   20–05, crepuscular 05–08 and 17–20, diurnal 08–17.
+5. **Images.** The pipeline reads images from `data/raw/images/`. To use the committed 2,500-image
+   subset, point `IMAGES_DIR` in `config.py` at `data/subset`, or copy the images across.
+
+### 12.6 Next steps
+
+1. `python run_pipeline.py --step classify`, then `--step encounter`. The SpeciesNet benchmark
+   card and Review Queue will fill in automatically.
+2. Increase the sample size (`python run_pipeline.py --limit 2500`), ideally using `data/subset`.
+3. Resolve the integration items in 12.5.
+4. Rehearse the demo on the dashboard (Activity Timeline → Sightings → Review Queue → AI Summary).
+
