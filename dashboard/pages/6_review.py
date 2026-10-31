@@ -29,15 +29,18 @@ SPECIES_CHOICES = sorted(q.SPECIES, key=lambda k: q.SPECIES[k][0])
 fmt = lambda k: f"{q.SPECIES[k][0]} ({q.SPECIES[k][1]})"
 
 
-def save(fn):
+def save(fn, feedback_entry=None):
     conn = q.connect()
     try:
         q.ensure_review_schema(conn)
+        q.ensure_feedback_schema(conn)
         fn(conn)
+        if feedback_entry:
+            q.log_feedback(conn, **feedback_entry)
         conn.commit()
     finally:
         conn.close()
-    st.toast("Decision saved to the database")
+    st.toast("Decision saved — feedback logged for model learning")
     st.rerun()
 
 
@@ -71,31 +74,45 @@ def item(r, mode, n):
                                      format_func=fmt, key=f"s_{mode}_{r.det_id}")
                 if st.form_submit_button("Save decision", type="primary"):
                     common = q.SPECIES[label][0]
+                    fb_base = dict(detection_id=int(r.det_id), image_id=r.image_id,
+                                   location_id=r.location_id,
+                                   model_prediction=str(r.cls_species) if hasattr(r, "cls_species") and r.cls_species else str(r.common),
+                                   model_confidence=float(r.conf if mode == "cls" else r.det_conf),
+                                   previous_label=str(r.common),
+                                   label_source=str(r.label_source) if hasattr(r, "label_source") else "unknown")
                     if mode == "cls":
                         if action.startswith("Accept"):
-                            save(lambda c: c.execute("UPDATE classifications SET status='human_verified' WHERE id=?", (int(r.cls_id),)))
+                            fb = {**fb_base, "action": "accept", "human_label": str(r.cls_species)}
+                            save(lambda c: c.execute("UPDATE classifications SET status='human_verified' WHERE id=?", (int(r.cls_id),)),
+                                 feedback_entry=fb)
                         elif action == "Relabel":
+                            fb = {**fb_base, "action": "relabel", "human_label": label}
                             save(lambda c: c.execute("UPDATE classifications SET status='human_verified', human_label=?, "
                                                      "species_common=?, species_sci=? WHERE id=?",
-                                                     (label, common, q.SPECIES[label][1], int(r.cls_id))))
+                                                     (label, common, q.SPECIES[label][1], int(r.cls_id))),
+                                 feedback_entry=fb)
                         else:
-                            save(lambda c: c.execute("UPDATE classifications SET status='rejected' WHERE id=?", (int(r.cls_id),)))
+                            fb = {**fb_base, "action": "reject", "human_label": None}
+                            save(lambda c: c.execute("UPDATE classifications SET status='rejected' WHERE id=?", (int(r.cls_id),)),
+                                 feedback_entry=fb)
                     else:
                         if action.startswith("Confirm"):
+                            fb = {**fb_base, "action": "confirm", "human_label": label}
                             def confirm(c):
                                 c.execute("UPDATE detections SET reviewed=1, needs_review=0 WHERE id=?", (int(r.det_id),))
                                 c.execute("INSERT INTO classifications (detection_id, species_common, species_sci, family, conf_top1, "
                                           "human_label, status) VALUES (?,?,?,?,1.0,?, 'human_verified')",
                                           (int(r.det_id), common, q.SPECIES[label][1], q.SPECIES[label][2], label))
-                            save(confirm)
+                            save(confirm, feedback_entry=fb)
                         else:
+                            fb = {**fb_base, "action": "false_positive", "human_label": "empty"}
                             def reject(c):
                                 c.execute("UPDATE detections SET category='false_positive', reviewed=1 WHERE id=?", (int(r.det_id),))
                                 left = c.execute("SELECT COUNT(*) FROM detections WHERE image_id=? AND category='animal'",
                                                  (r.image_id,)).fetchone()[0]
                                 if left == 0:
                                     c.execute("UPDATE media SET status='empty' WHERE image_id=?", (r.image_id,))
-                            save(reject)
+                            save(reject, feedback_entry=fb)
     html('<div style="height:14px"></div>')
 
 

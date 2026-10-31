@@ -194,6 +194,100 @@ def ensure_review_schema(conn):
         conn.commit()
 
 
+def ensure_feedback_schema(conn):
+    """Creates the feedback_log table for human-in-the-loop learning. Idempotent."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS feedback_log (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp   TEXT    NOT NULL DEFAULT (datetime('now')),
+        detection_id INTEGER NOT NULL,
+        image_id    TEXT,
+        location_id TEXT,
+        action      TEXT    NOT NULL,   -- accept, relabel, reject, confirm, false_positive
+        model_prediction TEXT,          -- what the AI predicted
+        model_confidence REAL,          -- AI's confidence score
+        human_label TEXT,               -- what the human decided
+        previous_label TEXT,            -- label before human intervention
+        label_source TEXT,              -- SpeciesNet / Ground truth / Unidentified
+        FOREIGN KEY (detection_id) REFERENCES detections(id)
+    )""")
+    conn.commit()
+
+
+def log_feedback(conn, detection_id: int, image_id: str, location_id: str,
+                 action: str, model_prediction: str, model_confidence: float,
+                 human_label: str, previous_label: str, label_source: str):
+    """Record a human review decision into the feedback_log for model retraining."""
+    ensure_feedback_schema(conn)
+    conn.execute("""INSERT INTO feedback_log
+        (detection_id, image_id, location_id, action, model_prediction,
+         model_confidence, human_label, previous_label, label_source)
+        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (detection_id, image_id, location_id, action, model_prediction,
+         model_confidence, human_label, previous_label, label_source))
+
+
+def feedback_stats(conn=None) -> dict:
+    """Aggregate feedback statistics for model learning analytics."""
+    close = False
+    if conn is None:
+        conn = connect()
+        close = True
+    try:
+        ensure_feedback_schema(conn)
+        total = conn.execute("SELECT COUNT(*) FROM feedback_log").fetchone()[0]
+        if total == 0:
+            return {"total_decisions": 0, "accuracy": None, "corrections": [],
+                    "by_action": {}, "by_species": [], "recent": []}
+
+        by_action = dict(conn.execute(
+            "SELECT action, COUNT(*) FROM feedback_log GROUP BY action").fetchall())
+
+        # Model accuracy: how often the human accepted the AI's prediction
+        accepted = by_action.get("accept", 0) + by_action.get("confirm", 0)
+        corrected = by_action.get("relabel", 0)
+        rejected = by_action.get("reject", 0) + by_action.get("false_positive", 0)
+        accuracy = accepted / total if total else 0.0
+
+        # Most common corrections (what the AI got wrong)
+        corrections = conn.execute("""
+            SELECT model_prediction, human_label, COUNT(*) as cnt
+            FROM feedback_log WHERE action='relabel' AND human_label IS NOT NULL
+            GROUP BY model_prediction, human_label ORDER BY cnt DESC LIMIT 10
+        """).fetchall()
+
+        # Per-species accuracy
+        by_species = conn.execute("""
+            SELECT model_prediction,
+                   SUM(CASE WHEN action IN ('accept','confirm') THEN 1 ELSE 0 END) as correct,
+                   COUNT(*) as total
+            FROM feedback_log WHERE model_prediction IS NOT NULL AND model_prediction != ''
+            GROUP BY model_prediction ORDER BY total DESC LIMIT 15
+        """).fetchall()
+
+        # Recent decisions for timeline
+        recent = conn.execute("""
+            SELECT timestamp, action, model_prediction, human_label, model_confidence
+            FROM feedback_log ORDER BY timestamp DESC LIMIT 20
+        """).fetchall()
+
+        return {
+            "total_decisions": total,
+            "accepted": accepted,
+            "corrected": corrected,
+            "rejected": rejected,
+            "accuracy": round(accuracy, 3),
+            "by_action": by_action,
+            "corrections": [{"predicted": r[0], "corrected_to": r[1], "count": r[2]} for r in corrections],
+            "by_species": [{"species": r[0], "correct": r[1], "total": r[2],
+                            "accuracy": round(r[1] / r[2], 3) if r[2] else 0} for r in by_species],
+            "recent": [{"time": r[0], "action": r[1], "predicted": r[2],
+                        "human": r[3], "confidence": r[4]} for r in recent],
+        }
+    finally:
+        if close:
+            conn.close()
+
+
 # ── Independent encounters (30-min rule, same species + site) ──
 def encounters(obs: pd.DataFrame) -> pd.DataFrame:
     o = obs.dropna(subset=["ts"]).sort_values(["location_id", "species", "ts"])
